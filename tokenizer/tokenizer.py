@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import codecs
 import json
 from itertools import islice
 import multiprocessing as mp
-from typing import Iterable, Iterator, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import regex as re
 
@@ -11,8 +13,20 @@ from .constants import PAT
 
 
 EncodeUnit = tuple[str, bool]
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+DEFAULT_READ_CHUNK_SIZE_BYTES = 4_194_304
+DEFAULT_PROGRESS_INTERVAL_BYTES = 134_217_728
 
 _TOKENIZER_WORKER: Tokenizer | None = None
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    **event: Any,
+) -> None:
+    if callback is not None:
+        callback(event)
 
 
 def _build_special_split_re(special_tokens: Sequence[str]) -> re.Pattern[str] | None:
@@ -29,6 +43,263 @@ def _chunked(items: Iterable[EncodeUnit], chunk_size: int) -> Iterator[list[Enco
         if not chunk:
             return
         yield chunk
+
+
+def _iter_text_chunks_from_file(
+    path: str | Path,
+    read_chunk_size_bytes: int = DEFAULT_READ_CHUNK_SIZE_BYTES,
+    progress_interval_bytes: int | None = DEFAULT_PROGRESS_INTERVAL_BYTES,
+    progress_callback: ProgressCallback | None = None,
+    progress_stage: str = "file_read",
+) -> Iterator[str]:
+    if read_chunk_size_bytes < 1:
+        raise ValueError("read_chunk_size_bytes must be >= 1")
+
+    file_path = Path(path)
+    total_bytes = file_path.stat().st_size
+    bytes_processed = 0
+    last_report = 0
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    with open(file_path, "rb") as f:
+        while True:
+            raw = f.read(read_chunk_size_bytes)
+            if not raw:
+                break
+
+            bytes_processed += len(raw)
+            chunk = decoder.decode(raw, final=False)
+            if chunk:
+                yield chunk
+
+            if (
+                progress_interval_bytes is not None
+                and (
+                    bytes_processed - last_report >= progress_interval_bytes
+                    or bytes_processed == total_bytes
+                )
+            ):
+                last_report = bytes_processed
+                _emit_progress(
+                    progress_callback,
+                    stage=progress_stage,
+                    bytes_processed=bytes_processed,
+                    total_bytes=total_bytes,
+                    path=str(file_path),
+                )
+
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield tail
+
+    if progress_interval_bytes is None and total_bytes > 0:
+        return
+
+    if bytes_processed == total_bytes and bytes_processed != last_report:
+        _emit_progress(
+            progress_callback,
+            stage=progress_stage,
+            bytes_processed=bytes_processed,
+            total_bytes=total_bytes,
+            path=str(file_path),
+        )
+
+
+def _consume_nonspecial_units(
+    text: str,
+    pretok_re: re.Pattern[str],
+    *,
+    final_segment: bool,
+) -> tuple[list[EncodeUnit], str]:
+    emitted: list[EncodeUnit] = []
+    if not text:
+        return emitted, ""
+
+    carry_start = len(text)
+    for match in pretok_re.finditer(text):
+        token = match.group(0)
+        if not token:
+            continue
+
+        if not final_segment and match.end() == len(text):
+            carry_start = match.start()
+            break
+
+        emitted.append((token, False))
+        carry_start = match.end()
+
+    if final_segment:
+        return emitted, ""
+
+    return emitted, text[carry_start:]
+
+
+def _consume_buffer_to_units(
+    buffer: str,
+    pretok_re: re.Pattern[str],
+    special_tokens: Sequence[str],
+    special_split_re: re.Pattern[str] | None,
+    *,
+    final_buffer: bool,
+) -> tuple[list[EncodeUnit], str]:
+    emitted: list[EncodeUnit] = []
+    if not buffer:
+        return emitted, ""
+
+    if special_split_re is None:
+        return _consume_nonspecial_units(
+            buffer,
+            pretok_re,
+            final_segment=final_buffer,
+        )
+
+    if final_buffer:
+        cursor = 0
+        for match in special_split_re.finditer(buffer):
+            segment_units, _ = _consume_nonspecial_units(
+                buffer[cursor : match.start()],
+                pretok_re,
+                final_segment=True,
+            )
+            emitted.extend(segment_units)
+            emitted.append((match.group(0), True))
+            cursor = match.end()
+
+        segment_units, _ = _consume_nonspecial_units(
+            buffer[cursor:],
+            pretok_re,
+            final_segment=True,
+        )
+        emitted.extend(segment_units)
+        return emitted, ""
+
+    max_special_length = max(len(token) for token in special_tokens)
+    safe_special_start = max(0, len(buffer) - max_special_length + 1)
+
+    cursor = 0
+    for match in special_split_re.finditer(buffer):
+        if match.start() >= safe_special_start:
+            break
+
+        segment_units, _ = _consume_nonspecial_units(
+            buffer[cursor : match.start()],
+            pretok_re,
+            final_segment=True,
+        )
+        emitted.extend(segment_units)
+        emitted.append((match.group(0), True))
+        cursor = match.end()
+
+    tail = buffer[cursor:]
+    safe_plain_end = max(0, safe_special_start - cursor)
+    safe_plain_prefix = tail[:safe_plain_end]
+
+    prefix_units, prefix_leftover = _consume_nonspecial_units(
+        safe_plain_prefix,
+        pretok_re,
+        final_segment=False,
+    )
+    emitted.extend(prefix_units)
+
+    leftover = prefix_leftover + tail[safe_plain_end:]
+    return emitted, leftover
+
+
+def iter_encode_units_from_chunks(
+    chunks: Iterable[str],
+    special_tokens: Sequence[str],
+    pretok_re: re.Pattern[str] | None = None,
+    special_split_re: re.Pattern[str] | None = None,
+) -> Iterator[EncodeUnit]:
+    compiled_pretok_re = pretok_re or re.compile(PAT)
+    compiled_special_split_re = (
+        special_split_re
+        if special_split_re is not None
+        else _build_special_split_re(special_tokens)
+    )
+
+    buffer = ""
+    for chunk in chunks:
+        if not chunk:
+            continue
+
+        buffer += chunk
+        emitted, buffer = _consume_buffer_to_units(
+            buffer,
+            compiled_pretok_re,
+            special_tokens,
+            compiled_special_split_re,
+            final_buffer=False,
+        )
+        yield from emitted
+
+    emitted, buffer = _consume_buffer_to_units(
+        buffer,
+        compiled_pretok_re,
+        special_tokens,
+        compiled_special_split_re,
+        final_buffer=True,
+    )
+    yield from emitted
+
+    if buffer:
+        raise RuntimeError("Tokenizer stream finished with unconsumed buffer")
+
+
+def iter_encode_units_from_text(
+    text: str,
+    special_tokens: Sequence[str],
+) -> Iterator[EncodeUnit]:
+    yield from iter_encode_units_from_chunks((text,), special_tokens)
+
+
+def iter_encode_units_from_file(
+    path: str | Path,
+    special_tokens: Sequence[str],
+    read_chunk_size_bytes: int = DEFAULT_READ_CHUNK_SIZE_BYTES,
+    progress_interval_bytes: int | None = DEFAULT_PROGRESS_INTERVAL_BYTES,
+    progress_callback: ProgressCallback | None = None,
+    progress_stage: str = "file_read",
+) -> Iterator[EncodeUnit]:
+    yield from iter_encode_units_from_chunks(
+        _iter_text_chunks_from_file(
+            path=path,
+            read_chunk_size_bytes=read_chunk_size_bytes,
+            progress_interval_bytes=progress_interval_bytes,
+            progress_callback=progress_callback,
+            progress_stage=progress_stage,
+        ),
+        special_tokens=special_tokens,
+    )
+
+
+def iter_pretokens_from_text(
+    text: str,
+    special_tokens: Sequence[str],
+) -> Iterator[str]:
+    for unit_text, is_special in iter_encode_units_from_text(text, special_tokens):
+        if not is_special:
+            yield unit_text
+
+
+def iter_pretokens_from_file(
+    path: str | Path,
+    special_tokens: Sequence[str],
+    read_chunk_size_bytes: int = DEFAULT_READ_CHUNK_SIZE_BYTES,
+    progress_interval_bytes: int | None = DEFAULT_PROGRESS_INTERVAL_BYTES,
+    progress_callback: ProgressCallback | None = None,
+    progress_stage: str = "file_read",
+) -> Iterator[str]:
+    for unit_text, is_special in iter_encode_units_from_file(
+        path=path,
+        special_tokens=special_tokens,
+        read_chunk_size_bytes=read_chunk_size_bytes,
+        progress_interval_bytes=progress_interval_bytes,
+        progress_callback=progress_callback,
+        progress_stage=progress_stage,
+    ):
+        if not is_special:
+            yield unit_text
 
 
 def _init_tokenizer_worker(
@@ -88,18 +359,6 @@ class Tokenizer:
         merges_filepath: str,
         special_tokens: list[str] | None = None,
     ) -> "Tokenizer":
-        """
-        Loads vocab + merges from disk. This assumes JSON serialization.
-        Since different students serialize differently, this is implemented to be tolerant.
-
-        Recommended formats:
-          vocab.json: { "0": [104], "1": [101], ... }  # list of ints = bytes
-            OR
-          vocab.json: { "0": "68656c6c6f" }  # hex string
-        merges.json: [ [[104],[101]], [[...],[...]], ... ]
-            OR
-        merges.json: [ ["68","65"], ... ] in hex strings
-        """
         with open(vocab_filepath, "r", encoding="utf-8") as f:
             raw_vocab = json.load(f)
 
@@ -125,7 +384,7 @@ class Tokenizer:
                 raise ValueError("Each merge must be a 2-item list/tuple")
             a, b = pair
 
-            def to_bytes(x) -> bytes:
+            def to_bytes(x: list[int] | str) -> bytes:
                 if isinstance(x, list):
                     return bytes(x)
                 if isinstance(x, str):
@@ -150,18 +409,14 @@ class Tokenizer:
         return [[list(left), list(right)] for left, right in self.merges]
 
     def _merge_one_best_rank(self, tokens: list[bytes]) -> tuple[bool, list[bytes]]:
-        """
-        Find the adjacent pair with the smallest merge rank and merge it once.
-        Returns (did_merge, new_tokens).
-        """
         best_i = None
         best_rank = None
 
         for i in range(len(tokens) - 1):
             pair = (tokens[i], tokens[i + 1])
-            r = self.merge_rank.get(pair)
-            if r is not None and (best_rank is None or r < best_rank):
-                best_rank = r
+            rank = self.merge_rank.get(pair)
+            if rank is not None and (best_rank is None or rank < best_rank):
+                best_rank = rank
                 best_i = i
 
         if best_i is None:
@@ -172,10 +427,6 @@ class Tokenizer:
         return True, new_tokens
 
     def _bpe_merge(self, tokens: list[bytes]) -> list[bytes]:
-        """
-        Apply BPE merges within ONE pre-token (no crossing pre-token boundaries).
-        We repeatedly merge the best-ranked applicable pair until none apply.
-        """
         while True:
             did_merge, tokens = self._merge_one_best_rank(tokens)
             if not did_merge:
@@ -200,29 +451,16 @@ class Tokenizer:
         return self._encode_pretoken(unit_text)
 
     def _iter_encode_units(self, text: str) -> Iterator[EncodeUnit]:
-        if not self.special_tokens:
-            for match in self._pretok_re.finditer(text):
-                pretoken = match.group(0)
-                if pretoken:
-                    yield pretoken, False
-            return
+        yield from iter_encode_units_from_chunks(
+            (text,),
+            self.special_tokens,
+            pretok_re=self._pretok_re,
+            special_split_re=self._special_split_re,
+        )
 
-        assert self._special_split_re is not None
-        parts = self._special_split_re.split(text)
-        for part in parts:
-            if not part:
-                continue
-            if part in self.special_tokens:
-                yield part, True
-                continue
-            for match in self._pretok_re.finditer(part):
-                pretoken = match.group(0)
-                if pretoken:
-                    yield pretoken, False
-
-    def iter_token_sequences(
+    def _iter_token_sequences_from_units(
         self,
-        text: str,
+        units: Iterable[EncodeUnit],
         num_workers: int = 1,
         batch_size: int = 4_096,
     ) -> Iterator[tuple[str, tuple[int, ...]]]:
@@ -231,7 +469,6 @@ class Tokenizer:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
 
-        units = self._iter_encode_units(text)
         if num_workers == 1:
             for unit_text, is_special in units:
                 yield unit_text, self._encode_unit(unit_text, is_special)
@@ -251,17 +488,46 @@ class Tokenizer:
                 for item in encoded_batch:
                     yield item
 
+    def iter_token_sequences(
+        self,
+        text: str,
+        num_workers: int = 1,
+        batch_size: int = 4_096,
+    ) -> Iterator[tuple[str, tuple[int, ...]]]:
+        yield from self._iter_token_sequences_from_units(
+            self._iter_encode_units(text),
+            num_workers=num_workers,
+            batch_size=batch_size,
+        )
+
+    def iter_token_sequences_from_file(
+        self,
+        path: str | Path,
+        num_workers: int = 1,
+        batch_size: int = 4_096,
+        read_chunk_size_bytes: int = DEFAULT_READ_CHUNK_SIZE_BYTES,
+        progress_interval_bytes: int | None = DEFAULT_PROGRESS_INTERVAL_BYTES,
+        progress_callback: ProgressCallback | None = None,
+        progress_stage: str = "tokenization",
+    ) -> Iterator[tuple[str, tuple[int, ...]]]:
+        yield from self._iter_token_sequences_from_units(
+            iter_encode_units_from_file(
+                path=path,
+                special_tokens=self.special_tokens,
+                read_chunk_size_bytes=read_chunk_size_bytes,
+                progress_interval_bytes=progress_interval_bytes,
+                progress_callback=progress_callback,
+                progress_stage=progress_stage,
+            ),
+            num_workers=num_workers,
+            batch_size=batch_size,
+        )
+
     def _encode_nonspecial_segment(self, text: str) -> list[int]:
-        """
-        Encode a string segment that contains NO special tokens.
-        Steps: pretokenize -> bytes -> BPE merge -> map to ids.
-        """
         out_ids: list[int] = []
-
-        for m in self._pretok_re.finditer(text):
-            pre = m.group(0)
-            out_ids.extend(self._encode_pretoken(pre))
-
+        for match in self._pretok_re.finditer(text):
+            pretoken = match.group(0)
+            out_ids.extend(self._encode_pretoken(pretoken))
         return out_ids
 
     def encode(
@@ -270,10 +536,6 @@ class Tokenizer:
         num_workers: int = 1,
         batch_size: int = 4_096,
     ) -> list[int]:
-        """
-        Encode text into token IDs.
-        Special tokens (if provided) are preserved as single tokens.
-        """
         ids: list[int] = []
         for _, sequence in self.iter_token_sequences(
             text,
@@ -284,18 +546,10 @@ class Tokenizer:
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        """
-        Memory-efficient encoding: yields IDs lazily.
-        NOTE: This intentionally does NOT allow tokens to cross chunk boundaries.
-        """
         for chunk in iterable:
-            for tid in self.encode(chunk):
-                yield tid
+            for token_id in self.encode(chunk):
+                yield token_id
 
     def decode(self, ids: list[int]) -> str:
-        """
-        Decode token IDs back to a Unicode string.
-        Invalid UTF-8 byte sequences are replaced with U+FFFD.
-        """
-        b = b"".join(self.vocab[i] for i in ids)
-        return b.decode("utf-8", errors="replace")
+        byte_string = b"".join(self.vocab[i] for i in ids)
+        return byte_string.decode("utf-8", errors="replace")

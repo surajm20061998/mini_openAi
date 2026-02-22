@@ -4,35 +4,25 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import islice
 import multiprocessing as mp
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Any, Iterable
 
-import regex as re
-
-from .constants import PAT
-
-
-def _build_special_split_re(special_tokens: Sequence[str]) -> re.Pattern[str] | None:
-    if not special_tokens:
-        return None
-    ordered = sorted(special_tokens, key=len, reverse=True)
-    return re.compile("|".join(re.escape(token) for token in ordered))
+from .tokenizer import (
+    DEFAULT_PROGRESS_INTERVAL_BYTES,
+    DEFAULT_READ_CHUNK_SIZE_BYTES,
+    ProgressCallback,
+    iter_pretokens_from_file,
+)
 
 
-def _iter_training_pretokens(text: str, special_tokens: Sequence[str]) -> Iterator[str]:
-    pretok_re = re.compile(PAT)
-    split_re = _build_special_split_re(special_tokens)
-    segments = split_re.split(text) if split_re is not None else [text]
-
-    for segment in segments:
-        if not segment:
-            continue
-        for match in pretok_re.finditer(segment):
-            token = match.group(0)
-            if token:
-                yield token
+def _emit_progress(
+    callback: ProgressCallback | None,
+    **event: Any,
+) -> None:
+    if callback is not None:
+        callback(event)
 
 
-def _chunked(items: Iterable[str], chunk_size: int) -> Iterator[list[str]]:
+def _chunked(items: Iterable[str], chunk_size: int) -> Iterable[list[str]]:
     iterator = iter(items)
     while True:
         chunk = list(islice(iterator, chunk_size))
@@ -44,8 +34,8 @@ def _chunked(items: Iterable[str], chunk_size: int) -> Iterator[list[str]]:
 def _count_word_freq_batch(
     batch: list[str],
     byte_ids_start: int,
-) -> Counter[Tuple[int, ...]]:
-    word_freq: Counter[Tuple[int, ...]] = Counter()
+) -> Counter[tuple[int, ...]]:
+    word_freq: Counter[tuple[int, ...]] = Counter()
     for token in batch:
         byte_values = token.encode("utf-8", errors="replace")
         word = tuple(byte_ids_start + value for value in byte_values)
@@ -55,7 +45,7 @@ def _count_word_freq_batch(
 
 def _count_word_freq_batch_star(
     args: tuple[list[str], int],
-) -> Counter[Tuple[int, ...]]:
+) -> Counter[tuple[int, ...]]:
     batch, byte_ids_start = args
     return _count_word_freq_batch(batch, byte_ids_start)
 
@@ -69,13 +59,12 @@ class BPETrainer:
 
     def _build_word_freq(
         self,
-        text: str,
+        pretokens: Iterable[str],
         byte_ids_start: int,
         num_workers: int,
         pretoken_batch_size: int,
-    ) -> Counter[Tuple[int, ...]]:
-        pretokens = _iter_training_pretokens(text, self.special_tokens)
-        word_freq: Counter[Tuple[int, ...]] = Counter()
+    ) -> Counter[tuple[int, ...]]:
+        word_freq: Counter[tuple[int, ...]] = Counter()
 
         if num_workers == 1:
             for batch in _chunked(pretokens, pretoken_batch_size):
@@ -102,6 +91,10 @@ class BPETrainer:
         input_path: str,
         num_workers: int | None = None,
         pretoken_batch_size: int | None = None,
+        read_chunk_size_bytes: int = DEFAULT_READ_CHUNK_SIZE_BYTES,
+        progress_interval_bytes: int | None = DEFAULT_PROGRESS_INTERVAL_BYTES,
+        progress_callback: ProgressCallback | None = None,
+        merge_progress_every: int = 100,
     ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
         worker_count = self.num_workers if num_workers is None else int(num_workers)
         if worker_count < 1:
@@ -114,120 +107,153 @@ class BPETrainer:
         )
         if batch_size < 1:
             raise ValueError("pretoken_batch_size must be >= 1")
+        if read_chunk_size_bytes < 1:
+            raise ValueError("read_chunk_size_bytes must be >= 1")
+        if merge_progress_every < 1:
+            raise ValueError("merge_progress_every must be >= 1")
 
-        vocab: Dict[int, bytes] = {}
-        merges: List[Tuple[bytes, bytes]] = []
+        vocab: dict[int, bytes] = {}
+        merges: list[tuple[bytes, bytes]] = []
 
         next_id = 0
-        for s in self.special_tokens:
-            vocab[next_id] = s.encode("utf-8")
+        for special_token in self.special_tokens:
+            vocab[next_id] = special_token.encode("utf-8")
             next_id += 1
 
         byte_ids_start = next_id
-        for i in range(256):
-            vocab[next_id] = bytes([i])
+        for byte_value in range(256):
+            vocab[next_id] = bytes([byte_value])
             next_id += 1
 
         num_merges = self.vocab_size - len(self.special_tokens) - 256
         if num_merges <= 0:
             return vocab, merges
 
-        with open(input_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
-
         word_freq = self._build_word_freq(
-            text=text,
+            pretokens=iter_pretokens_from_file(
+                path=input_path,
+                special_tokens=self.special_tokens,
+                read_chunk_size_bytes=read_chunk_size_bytes,
+                progress_interval_bytes=progress_interval_bytes,
+                progress_callback=progress_callback,
+                progress_stage="bpe_count",
+            ),
             byte_ids_start=byte_ids_start,
             num_workers=worker_count,
             pretoken_batch_size=batch_size,
         )
 
+        _emit_progress(
+            progress_callback,
+            stage="bpe_count_complete",
+            unique_words=len(word_freq),
+            input_path=input_path,
+        )
+
         if not word_freq:
             return vocab, merges
 
-        words: List[List[int]] = [list(w) for w in word_freq.keys()]
-        freqs: List[int] = [word_freq[tuple(w)] for w in word_freq.keys()]
+        words: list[list[int]] = [list(word) for word in word_freq.keys()]
+        freqs: list[int] = [word_freq[tuple(word)] for word in word_freq.keys()]
 
-        def iter_pairs(w: List[int]):
-            for i in range(len(w) - 1):
-                yield (w[i], w[i + 1])
+        def iter_pairs(word: list[int]) -> Iterable[tuple[int, int]]:
+            for index in range(len(word) - 1):
+                yield word[index], word[index + 1]
 
-        def merge_pair_in_word(w: List[int], a: int, b: int, new_id: int) -> List[int]:
-            out: List[int] = []
-            i = 0
-            n = len(w)
-            while i < n:
-                if i + 1 < n and w[i] == a and w[i + 1] == b:
-                    out.append(new_id)
-                    i += 2
+        def merge_pair_in_word(
+            word: list[int],
+            left_id: int,
+            right_id: int,
+            new_id: int,
+        ) -> list[int]:
+            merged_word: list[int] = []
+            index = 0
+            while index < len(word):
+                if (
+                    index + 1 < len(word)
+                    and word[index] == left_id
+                    and word[index + 1] == right_id
+                ):
+                    merged_word.append(new_id)
+                    index += 2
                 else:
-                    out.append(w[i])
-                    i += 1
-            return out
+                    merged_word.append(word[index])
+                    index += 1
+            return merged_word
 
-        pair_counts: Counter[Tuple[int, int]] = Counter()
-        pair_to_words: dict[Tuple[int, int], set[int]] = defaultdict(set)
+        pair_counts: Counter[tuple[int, int]] = Counter()
+        pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)
 
-        for wi, w in enumerate(words):
-            f = freqs[wi]
-            if f <= 0 or len(w) < 2:
+        for word_index, word in enumerate(words):
+            freq = freqs[word_index]
+            if freq <= 0 or len(word) < 2:
                 continue
-            for p in iter_pairs(w):
-                pair_counts[p] += f
-                pair_to_words[p].add(wi)
+            for pair in iter_pairs(word):
+                pair_counts[pair] += freq
+                pair_to_words[pair].add(word_index)
 
-        for _ in range(num_merges):
-
+        for merge_index in range(num_merges):
             best_pair = None
             best_key = None
 
-            for (a, b), c in pair_counts.items():
-                if c <= 0:
+            for (left_id, right_id), count in pair_counts.items():
+                if count <= 0:
                     continue
-                key = (c, vocab[a], vocab[b])
+                key = (count, vocab[left_id], vocab[right_id])
                 if best_key is None or key > best_key:
                     best_key = key
-                    best_pair = (a, b)
+                    best_pair = (left_id, right_id)
 
             if best_pair is None:
                 break
 
-            a, b = best_pair
-            new_bytes = vocab[a] + vocab[b]
+            left_id, right_id = best_pair
+            new_token_bytes = vocab[left_id] + vocab[right_id]
             new_id = next_id
-            vocab[new_id] = new_bytes
+            vocab[new_id] = new_token_bytes
             next_id += 1
-            merges.append((vocab[a], vocab[b]))
+            merges.append((vocab[left_id], vocab[right_id]))
 
-            affected = list(pair_to_words.get((a, b), ()))
-            if not affected:
-                pair_counts[(a, b)] = 0
-                continue
+            affected_words = list(pair_to_words.get((left_id, right_id), ()))
+            if not affected_words:
+                pair_counts[(left_id, right_id)] = 0
+            else:
+                for word_index in affected_words:
+                    old_word = words[word_index]
+                    freq = freqs[word_index]
+                    if freq <= 0 or len(old_word) < 2:
+                        continue
 
-            for wi in affected:
-                old_w = words[wi]
-                f = freqs[wi]
-                if f <= 0 or len(old_w) < 2:
-                    continue
+                    old_pairs = list(iter_pairs(old_word))
+                    for pair in old_pairs:
+                        pair_counts[pair] -= freq
+                        indices = pair_to_words.get(pair)
+                        if indices is not None:
+                            indices.discard(word_index)
+                            if not indices:
+                                pair_to_words.pop(pair, None)
 
-                old_pairs = list(iter_pairs(old_w))
-                for p in old_pairs:
-                    pair_counts[p] -= f
-                    s = pair_to_words.get(p)
-                    if s is not None:
-                        s.discard(wi)
-                        if not s:
-                            pair_to_words.pop(p, None)
+                    new_word = merge_pair_in_word(old_word, left_id, right_id, new_id)
+                    words[word_index] = new_word
 
-                new_w = merge_pair_in_word(old_w, a, b, new_id)
-                words[wi] = new_w
+                    if len(new_word) >= 2:
+                        for pair in iter_pairs(new_word):
+                            pair_counts[pair] += freq
+                            pair_to_words[pair].add(word_index)
 
-                if len(new_w) >= 2:
-                    for p in iter_pairs(new_w):
-                        pair_counts[p] += f
-                        pair_to_words[p].add(wi)
+                pair_counts[(left_id, right_id)] = 0
+                pair_to_words.pop((left_id, right_id), None)
 
-            pair_counts[(a, b)] = 0
-            pair_to_words.pop((a, b), None)
+            if (
+                (merge_index + 1) % merge_progress_every == 0
+                or (merge_index + 1) == num_merges
+            ):
+                _emit_progress(
+                    progress_callback,
+                    stage="bpe_merge",
+                    completed_merges=merge_index + 1,
+                    total_merges=num_merges,
+                    vocab_size=len(vocab),
+                )
 
         return vocab, merges
