@@ -19,6 +19,7 @@ python3 -c "from pathlib import Path; text=Path('data/TinyStoriesV2-GPT4-train.t
 python3 -c "from pathlib import Path; text=Path('data/TinyStoriesV2-GPT4-valid.txt').read_text(encoding='utf-8', errors='ignore').split(); Path('data/valid_5000w.txt').write_text(' '.join(text[:5000]), encoding='utf-8')"
 ```
 ### Running Tokenization Experiments
+```sh
 
 python3 scripts/make_token_npy.py \
   --train_txt data/train_5000w.txt \
@@ -48,6 +49,6 @@ python3 scripts/make_token_npy.py \
   --experiments_dir experiments \
   --out_train_npy data/train_tokens_5000w_w4.npy \
   --out_val_npy data/val_tokens_5000w_w4.npy
-
+```
 
 ### Experiment Records are Saved in /experiments
