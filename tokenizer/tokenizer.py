@@ -196,5 +196,3 @@ class Tokenizer:
         """
         b = b"".join(self.vocab[i] for i in ids)
         return b.decode("utf-8", errors="replace")
-
-        
