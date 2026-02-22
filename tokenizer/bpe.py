@@ -1,18 +1,120 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections import Counter, defaultdict
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from itertools import islice
+import multiprocessing as mp
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
 import regex as re
+
 from .constants import PAT
+
+
+def _build_special_split_re(special_tokens: Sequence[str]) -> re.Pattern[str] | None:
+    if not special_tokens:
+        return None
+    ordered = sorted(special_tokens, key=len, reverse=True)
+    return re.compile("|".join(re.escape(token) for token in ordered))
+
+
+def _iter_training_pretokens(text: str, special_tokens: Sequence[str]) -> Iterator[str]:
+    pretok_re = re.compile(PAT)
+    split_re = _build_special_split_re(special_tokens)
+    segments = split_re.split(text) if split_re is not None else [text]
+
+    for segment in segments:
+        if not segment:
+            continue
+        for match in pretok_re.finditer(segment):
+            token = match.group(0)
+            if token:
+                yield token
+
+
+def _chunked(items: Iterable[str], chunk_size: int) -> Iterator[list[str]]:
+    iterator = iter(items)
+    while True:
+        chunk = list(islice(iterator, chunk_size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def _count_word_freq_batch(
+    batch: list[str],
+    byte_ids_start: int,
+) -> Counter[Tuple[int, ...]]:
+    word_freq: Counter[Tuple[int, ...]] = Counter()
+    for token in batch:
+        byte_values = token.encode("utf-8", errors="replace")
+        word = tuple(byte_ids_start + value for value in byte_values)
+        word_freq[word] += 1
+    return word_freq
+
+
+def _count_word_freq_batch_star(
+    args: tuple[list[str], int],
+) -> Counter[Tuple[int, ...]]:
+    batch, byte_ids_start = args
+    return _count_word_freq_batch(batch, byte_ids_start)
+
 
 @dataclass
 class BPETrainer:
     vocab_size: int
     special_tokens: list[str]
+    num_workers: int = 1
+    pretoken_batch_size: int = 50_000
 
-    def train(self, input_path: str) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    def _build_word_freq(
+        self,
+        text: str,
+        byte_ids_start: int,
+        num_workers: int,
+        pretoken_batch_size: int,
+    ) -> Counter[Tuple[int, ...]]:
+        pretokens = _iter_training_pretokens(text, self.special_tokens)
+        word_freq: Counter[Tuple[int, ...]] = Counter()
+
+        if num_workers == 1:
+            for batch in _chunked(pretokens, pretoken_batch_size):
+                word_freq.update(_count_word_freq_batch(batch, byte_ids_start))
+            return word_freq
+
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=num_workers) as pool:
+            tasks = (
+                (batch, byte_ids_start)
+                for batch in _chunked(pretokens, pretoken_batch_size)
+            )
+            for partial_freq in pool.imap_unordered(
+                _count_word_freq_batch_star,
+                tasks,
+                chunksize=1,
+            ):
+                word_freq.update(partial_freq)
+
+        return word_freq
+
+    def train(
+        self,
+        input_path: str,
+        num_workers: int | None = None,
+        pretoken_batch_size: int | None = None,
+    ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+        worker_count = self.num_workers if num_workers is None else int(num_workers)
+        if worker_count < 1:
+            raise ValueError("num_workers must be >= 1")
+
+        batch_size = (
+            self.pretoken_batch_size
+            if pretoken_batch_size is None
+            else int(pretoken_batch_size)
+        )
+        if batch_size < 1:
+            raise ValueError("pretoken_batch_size must be >= 1")
+
         vocab: Dict[int, bytes] = {}
         merges: List[Tuple[bytes, bytes]] = []
 
@@ -30,26 +132,15 @@ class BPETrainer:
         if num_merges <= 0:
             return vocab, merges
 
-        pretok_re = re.compile(PAT)
-
-        split_re = None
-        if self.special_tokens:
-            split_re = re.compile("|".join(re.escape(s) for s in self.special_tokens))
-        word_freq: Counter[Tuple[int, ...]] = Counter()
-
         with open(input_path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
 
-        segments = split_re.split(text) if split_re is not None else [text]
-
-        for seg in segments:
-            if not seg:
-                continue
-            for m in pretok_re.finditer(seg):
-                tok = m.group(0)
-                b = tok.encode("utf-8", errors="replace")
-                word = tuple(byte_ids_start + x for x in b)
-                word_freq[word] += 1
+        word_freq = self._build_word_freq(
+            text=text,
+            byte_ids_start=byte_ids_start,
+            num_workers=worker_count,
+            pretoken_batch_size=batch_size,
+        )
 
         if not word_freq:
             return vocab, merges

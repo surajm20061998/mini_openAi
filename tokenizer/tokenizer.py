@@ -1,11 +1,56 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable, Iterator
+from itertools import islice
+import multiprocessing as mp
+from typing import Iterable, Iterator, Sequence
 
 import regex as re
 
 from .constants import PAT
+
+
+EncodeUnit = tuple[str, bool]
+
+_TOKENIZER_WORKER: Tokenizer | None = None
+
+
+def _build_special_split_re(special_tokens: Sequence[str]) -> re.Pattern[str] | None:
+    if not special_tokens:
+        return None
+    ordered = sorted(special_tokens, key=len, reverse=True)
+    return re.compile("(" + "|".join(re.escape(token) for token in ordered) + ")")
+
+
+def _chunked(items: Iterable[EncodeUnit], chunk_size: int) -> Iterator[list[EncodeUnit]]:
+    iterator = iter(items)
+    while True:
+        chunk = list(islice(iterator, chunk_size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def _init_tokenizer_worker(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    special_tokens: list[str],
+) -> None:
+    global _TOKENIZER_WORKER
+    _TOKENIZER_WORKER = Tokenizer(
+        vocab=vocab,
+        merges=merges,
+        special_tokens=special_tokens,
+    )
+
+
+def _encode_units_batch(batch: list[EncodeUnit]) -> list[tuple[str, tuple[int, ...]]]:
+    if _TOKENIZER_WORKER is None:
+        raise RuntimeError("Tokenizer worker state was not initialized")
+    return [
+        (unit_text, _TOKENIZER_WORKER._encode_unit(unit_text, is_special))
+        for unit_text, is_special in batch
+    ]
 
 
 class Tokenizer:
@@ -34,12 +79,7 @@ class Tokenizer:
         }
 
         self._pretok_re = re.compile(PAT)
-
-        if self.special_tokens:
-            special_pat = "(" + "|".join(re.escape(s) for s in self.special_tokens) + ")"
-            self._special_split_re = re.compile(special_pat)
-        else:
-            self._special_split_re = None
+        self._special_split_re = _build_special_split_re(self.special_tokens)
 
     @classmethod
     def from_files(
@@ -103,6 +143,12 @@ class Tokenizer:
     def _bytes_to_byte_tokens(b: bytes) -> list[bytes]:
         return [bytes([x]) for x in b]
 
+    def to_serializable_vocab(self) -> dict[str, list[int]]:
+        return {str(idx): list(token_bytes) for idx, token_bytes in self.vocab.items()}
+
+    def to_serializable_merges(self) -> list[list[list[int]]]:
+        return [[list(left), list(right)] for left, right in self.merges]
+
     def _merge_one_best_rank(self, tokens: list[bytes]) -> tuple[bool, list[bytes]]:
         """
         Find the adjacent pair with the smallest merge rank and merge it once.
@@ -136,6 +182,75 @@ class Tokenizer:
                 break
         return tokens
 
+    def _encode_pretoken(self, pretoken: str) -> tuple[int, ...]:
+        byte_tokens = self._bytes_to_byte_tokens(pretoken.encode("utf-8"))
+        merged_tokens = self._bpe_merge(byte_tokens)
+
+        ids: list[int] = []
+        for token_bytes in merged_tokens:
+            token_id = self.bytes_to_id.get(token_bytes)
+            if token_id is None:
+                raise KeyError(f"Token bytes not found in vocab: {token_bytes!r}")
+            ids.append(token_id)
+        return tuple(ids)
+
+    def _encode_unit(self, unit_text: str, is_special: bool) -> tuple[int, ...]:
+        if is_special:
+            return (self.bytes_to_id[unit_text.encode("utf-8")],)
+        return self._encode_pretoken(unit_text)
+
+    def _iter_encode_units(self, text: str) -> Iterator[EncodeUnit]:
+        if not self.special_tokens:
+            for match in self._pretok_re.finditer(text):
+                pretoken = match.group(0)
+                if pretoken:
+                    yield pretoken, False
+            return
+
+        assert self._special_split_re is not None
+        parts = self._special_split_re.split(text)
+        for part in parts:
+            if not part:
+                continue
+            if part in self.special_tokens:
+                yield part, True
+                continue
+            for match in self._pretok_re.finditer(part):
+                pretoken = match.group(0)
+                if pretoken:
+                    yield pretoken, False
+
+    def iter_token_sequences(
+        self,
+        text: str,
+        num_workers: int = 1,
+        batch_size: int = 4_096,
+    ) -> Iterator[tuple[str, tuple[int, ...]]]:
+        if num_workers < 1:
+            raise ValueError("num_workers must be >= 1")
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+
+        units = self._iter_encode_units(text)
+        if num_workers == 1:
+            for unit_text, is_special in units:
+                yield unit_text, self._encode_unit(unit_text, is_special)
+            return
+
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=_init_tokenizer_worker,
+            initargs=(self.vocab, self.merges, self.special_tokens),
+        ) as pool:
+            for encoded_batch in pool.imap(
+                _encode_units_batch,
+                _chunked(units, batch_size),
+                chunksize=1,
+            ):
+                for item in encoded_batch:
+                    yield item
+
     def _encode_nonspecial_segment(self, text: str) -> list[int]:
         """
         Encode a string segment that contains NO special tokens.
@@ -144,40 +259,28 @@ class Tokenizer:
         out_ids: list[int] = []
 
         for m in self._pretok_re.finditer(text):
-            pre = m.group(0)  # keep leading space
-            byte_tokens = self._bytes_to_byte_tokens(pre.encode("utf-8"))
-            merged_tokens = self._bpe_merge(byte_tokens)
-
-            for t in merged_tokens:
-                tid = self.bytes_to_id.get(t)
-                if tid is None:
-                    # In a correct setup this shouldn't happen (merged tokens should be in vocab),
-                    # but be explicit to avoid silent wrong results.
-                    raise KeyError(f"Token bytes not found in vocab: {t!r}")
-                out_ids.append(tid)
+            pre = m.group(0)
+            out_ids.extend(self._encode_pretoken(pre))
 
         return out_ids
 
-    def encode(self, text: str) -> list[int]:
+    def encode(
+        self,
+        text: str,
+        num_workers: int = 1,
+        batch_size: int = 4_096,
+    ) -> list[int]:
         """
         Encode text into token IDs.
         Special tokens (if provided) are preserved as single tokens.
         """
-        if not self.special_tokens:
-            return self._encode_nonspecial_segment(text)
-
-        assert self._special_split_re is not None
-        parts = self._special_split_re.split(text) 
-
         ids: list[int] = []
-        for part in parts:
-            if part == "" or part is None:
-                continue
-            if part in self.special_tokens:
-                bt = part.encode("utf-8")
-                ids.append(self.bytes_to_id[bt])
-            else:
-                ids.extend(self._encode_nonspecial_segment(part))
+        for _, sequence in self.iter_token_sequences(
+            text,
+            num_workers=num_workers,
+            batch_size=batch_size,
+        ):
+            ids.extend(sequence)
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
