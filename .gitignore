@@ -1,2 +1,10 @@
 /data
 /experiments
+
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.env
+.DS_Store
