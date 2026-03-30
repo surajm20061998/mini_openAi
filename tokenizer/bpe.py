@@ -140,3 +140,5 @@ class BPETrainer:
             pair_to_words.pop((a, b), None)
 
         return vocab, merges
+
+        
