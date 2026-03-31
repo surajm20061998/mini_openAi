@@ -128,11 +128,11 @@ python3 scripts/train_lm.py \
   --scratch_dir /tmp/mini_openai_run \
   --context_length 256 \
   --batch_size 32 \
-  --d_model 384 \
-  --num_layers 6 \
-  --num_heads 6 \
+  --d_model 512 \
+  --num_layers 8 \
+  --num_heads 8 \
   --d_ff 1024 \
-  --max_iters 20000 \
+  --max_iters 40000 \
   --save_every 500 \
   --eval_every 500 \
   --device auto \
