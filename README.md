@@ -89,4 +89,63 @@ python3 scripts/download_token_artifacts.py \
 
 This creates `data/` if needed and saves the downloaded files there. The Google Drive files must be shared as `Anyone with the link`.
 
+### Publish Token Files To W&B Once
+
+```sh
+python3 scripts/publish_dataset_artifact.py \
+  --project YOUR_WANDB_PROJECT \
+  --entity YOUR_WANDB_ENTITY \
+  --artifact_name tinystories-bpe512-w8 \
+  --train_tokens_path data/train_tokens_full_w8.npy \
+  --val_tokens_path data/val_tokens_full_w8.npy \
+  --vocab_path experiments/numWorkers_8/vocab.json \
+  --merges_path experiments/numWorkers_8/merges.json \
+  --experiment_path experiments/numWorkers_8/experiment.json \
+  --aliases latest
+```
+
+### Stage A W&B Dataset Artifact Locally
+
+```sh
+python3 scripts/stage_dataset_artifact.py \
+  --artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-bpe512-w8:latest \
+  --out_dir data/wandb_dataset \
+  --manifest_path data/wandb_dataset/manifest.json
+```
+
+### Train With W&B Checkpoint Artifacts
+
+```sh
+python3 scripts/train_lm.py \
+  --dataset_artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-bpe512-w8:latest \
+  --wandb_project YOUR_WANDB_PROJECT \
+  --wandb_entity YOUR_WANDB_ENTITY \
+  --wandb_mode online \
+  --checkpoint_artifact_name tinystories-transformer-checkpoints \
+  --checkpoint_keep_milestone_every 5000 \
+  --scratch_dir /tmp/mini_openai_run \
+  --context_length 256 \
+  --batch_size 32 \
+  --d_model 384 \
+  --num_layers 6 \
+  --num_heads 6 \
+  --d_ff 1024 \
+  --max_iters 5000 \
+  --save_every 500 \
+  --eval_every 500
+```
+
+To resume from W&B:
+
+```sh
+python3 scripts/train_lm.py \
+  --dataset_artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-bpe512-w8:latest \
+  --resume_artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-transformer-checkpoints:latest \
+  --resume \
+  --wandb_project YOUR_WANDB_PROJECT \
+  --wandb_entity YOUR_WANDB_ENTITY \
+  --wandb_mode online \
+  --checkpoint_artifact_name tinystories-transformer-checkpoints \
+  --scratch_dir /tmp/mini_openai_run
+```
 

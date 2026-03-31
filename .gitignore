@@ -1,5 +1,7 @@
 /data
 /experiments
+/checkpoints
+/wandb
 
 __pycache__/
 *.py[cod]
