@@ -117,9 +117,11 @@ python3 scripts/stage_dataset_artifact.py \
 
 ```sh
 python3 scripts/train_lm.py \
-  --dataset_artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-bpe512-w8:latest \
-  --wandb_project YOUR_WANDB_PROJECT \
-  --wandb_entity YOUR_WANDB_ENTITY \
+  --train_tokens_path data/train_tokens_full_w8.npy \
+  --val_tokens_path data/val_tokens_full_w8.npy \
+  --vocab_json_path data/vocab.json \
+  --wandb_project trainLLMFromCratch \
+  --wandb_entity surajm20061998-new-york-university \
   --wandb_mode online \
   --checkpoint_artifact_name tinystories-transformer-checkpoints \
   --checkpoint_keep_milestone_every 5000 \
@@ -130,20 +132,22 @@ python3 scripts/train_lm.py \
   --num_layers 6 \
   --num_heads 6 \
   --d_ff 1024 \
-  --max_iters 5000 \
+  --max_iters 20000 \
   --save_every 500 \
-  --eval_every 500
+  --eval_every 500 \
+  --device auto \
+  --dtype float32
 ```
 
 To resume from W&B:
 
 ```sh
 python3 scripts/train_lm.py \
-  --dataset_artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-bpe512-w8:latest \
-  --resume_artifact YOUR_WANDB_ENTITY/YOUR_WANDB_PROJECT/tinystories-transformer-checkpoints:latest \
+  --dataset_artifact surajm20061998-new-york-university/trainLLMFromCratch/tinystories-bpe512-w8:latest \
+  --resume_artifact surajm20061998-new-york-university/trainLLMFromCratch/tinystories-transformer-checkpoints:latest \
   --resume \
-  --wandb_project YOUR_WANDB_PROJECT \
-  --wandb_entity YOUR_WANDB_ENTITY \
+  --wandb_project trainLLMFromCratch \
+  --wandb_entity surajm20061998-new-york-university \
   --wandb_mode online \
   --checkpoint_artifact_name tinystories-transformer-checkpoints \
   --scratch_dir /tmp/mini_openai_run
