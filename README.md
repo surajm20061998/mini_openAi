@@ -76,3 +76,24 @@ python3 scripts/make_token_npy.py \
 ```
 
 ### Experiment Records are Saved in /experiments
+
+### Download Token Artifacts From Google Drive
+
+```sh
+python3 scripts/download_token_artifacts.py \
+  --train "GOOGLE_DRIVE_TRAIN_URL_OR_FILE_ID" \
+  --val "GOOGLE_DRIVE_VAL_URL_OR_FILE_ID" \
+  --vocab "GOOGLE_DRIVE_VOCAB_URL_OR_FILE_ID" \
+  --merges "GOOGLE_DRIVE_MERGES_URL_OR_FILE_ID"
+```
+
+This creates `data/` if needed and saves the downloaded files there. The Google Drive files must be shared as `Anyone with the link`.
+
+
+### Links for Token Artifacts 
+
+- Train: https://drive.google.com/file/d/1EMlICcTXuBSY6xq5izKHNyzQtwIvHjYP/view?usp=sharing
+- Val: https://drive.google.com/file/d/1Bphmuk_Q6Tpcj0GRtLJ5A-_w2rfWqrJ0/view?usp=drive_link
+- Vocab: https://drive.google.com/file/d/1cozhTjHjYvMHa4Wjd1-rkOwqG3hN7N3N/view?usp=drive_link
+- Merges: https://drive.google.com/file/d/1VQ333000000000000000000000000000/view?usp=sharing
+

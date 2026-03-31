@@ -1,0 +1,6 @@
+# Core runtime dependencies for the current training/tokenization scripts.
+# On NVIDIA GPU systems, you may want to install a CUDA-specific PyTorch wheel
+# from https://pytorch.org/get-started/locally/ instead of relying on the default index.
+numpy
+regex
+torch
