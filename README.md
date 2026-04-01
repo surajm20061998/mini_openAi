@@ -153,3 +153,48 @@ python3 scripts/train_lm.py \
   --scratch_dir /tmp/mini_openai_run
 ```
 
+### Run A Compute-Optimal Scaling Sweep
+
+This sweep runs the following model sizes:
+
+- Small: `d_model=256`, `num_layers=4`, `num_heads=4`, `d_ff=768`
+- Medium: `d_model=384`, `num_layers=6`, `num_heads=6`, `d_ff=1024`
+- Large: `d_model=512`, `num_layers=8`, `num_heads=8`, `d_ff=1536`
+
+and the following token budgets:
+
+- `25M`
+- `50M`
+- `100M`
+- `200M`
+
+Each run is recorded under `sweep_experiments/`, and the trainer now logs:
+
+- `val/loss`
+- `val/ppl`
+- `train/tokens_seen`
+- `perf/wall_clock_seconds`
+- `perf/tokens_per_second`
+- `model/parameter_count`
+- `perf/flops_proxy`
+
+Run the sweep with local token files:
+
+```sh
+WANDB_PROJECT=trainLLMFromCratch \
+WANDB_ENTITY=surajm20061998-new-york-university \
+DEVICE=auto \
+DTYPE=float32 \
+bash scripts/run_compute_optimal_scaling_sweep.sh
+```
+
+Or run the same sweep against a W&B dataset artifact:
+
+```sh
+WANDB_PROJECT=trainLLMFromCratch \
+WANDB_ENTITY=surajm20061998-new-york-university \
+DATASET_ARTIFACT=surajm20061998-new-york-university/trainLLMFromCratch/tinystories-bpe512-w8:latest \
+DEVICE=auto \
+DTYPE=float32 \
+bash scripts/run_compute_optimal_scaling_sweep.sh
+```

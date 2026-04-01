@@ -1,5 +1,6 @@
 /data
 /experiments
+/sweep_experiments
 /checkpoints
 /wandb
 

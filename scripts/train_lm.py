@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import json
 import math
 import multiprocessing as mp
 from pathlib import Path
@@ -129,6 +130,7 @@ class TrainConfig:
     grad_clip: float
 
     max_iters: int
+    target_tokens_seen: Optional[int]
     log_every: int
     eval_every: int
     eval_batches: int
@@ -171,6 +173,8 @@ class TrainConfig:
     checkpoint_keep_milestone_every: int
     checkpoint_ttl_days: Optional[int]
 
+    run_record_dir: Optional[str]
+
 
 def pick_device(requested: str) -> torch.device:
     if requested != "auto":
@@ -198,6 +202,33 @@ def load_memmap_tokens(path: str) -> np.ndarray:
     if not np.issubdtype(arr.dtype, np.integer):
         raise ValueError(f"Expected integer tokens, got dtype={arr.dtype}")
     return arr
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def _tokens_per_step(cfg: TrainConfig) -> int:
+    return cfg.batch_size * cfg.context_length
+
+
+def _resolve_training_budget(cfg: TrainConfig) -> None:
+    if cfg.target_tokens_seen is None:
+        return
+
+    tokens_per_step = _tokens_per_step(cfg)
+    resolved_max_iters = math.ceil(cfg.target_tokens_seen / tokens_per_step)
+    cfg.max_iters = max(1, resolved_max_iters)
+    print(
+        f"[budget] target_tokens_seen={cfg.target_tokens_seen} "
+        f"| tokens_per_step={tokens_per_step} | max_iters={cfg.max_iters}"
+    )
+
+
+def _write_json(path: str | Path, payload: dict[str, object]) -> None:
+    output_path = Path(path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _default_checkpoint_path(cfg: TrainConfig) -> str:
@@ -369,7 +400,12 @@ def evaluate(
 
 
 def train(cfg: TrainConfig) -> None:
+    _resolve_training_budget(cfg)
     _validate_cfg(cfg)
+
+    run_record_dir = Path(cfg.run_record_dir).expanduser().resolve() if cfg.run_record_dir else None
+    if run_record_dir is not None:
+        run_record_dir.mkdir(parents=True, exist_ok=True)
 
     configure_wandb_environment(
         scratch_dir=cfg.scratch_dir,
@@ -404,18 +440,6 @@ def train(cfg: TrainConfig) -> None:
         dtype = pick_dtype(cfg.dtype)
         print(f"[device] {device} | [dtype] {dtype}")
 
-        if wandb_run is not None:
-            wandb_run.config.update(
-                {
-                    "resolved_train_tokens_path": train_tokens_path,
-                    "resolved_val_tokens_path": val_tokens_path,
-                    "resolved_vocab_json_path": vocab_json_path,
-                    "resolved_ckpt_path": cfg.ckpt_path,
-                    "resolved_vocab_size": cfg.vocab_size,
-                },
-                allow_val_change=True,
-            )
-
         val_tokens = load_memmap_tokens(val_tokens_path) if val_tokens_path else None
 
         assert cfg.vocab_size is not None
@@ -430,6 +454,42 @@ def train(cfg: TrainConfig) -> None:
             device=device,
             dtype=dtype,
         )
+        parameter_count = count_parameters(model)
+        tokens_per_step = _tokens_per_step(cfg)
+        print(f"[model] parameters={parameter_count} | tokens_per_step={tokens_per_step}")
+
+        if wandb_run is not None:
+            wandb_run.config.update(
+                {
+                    "resolved_train_tokens_path": train_tokens_path,
+                    "resolved_val_tokens_path": val_tokens_path,
+                    "resolved_vocab_json_path": vocab_json_path,
+                    "resolved_ckpt_path": cfg.ckpt_path,
+                    "resolved_vocab_size": cfg.vocab_size,
+                    "resolved_max_iters": cfg.max_iters,
+                    "resolved_target_tokens_seen": cfg.target_tokens_seen,
+                    "model/parameter_count": parameter_count,
+                    "train/tokens_per_step": tokens_per_step,
+                },
+                allow_val_change=True,
+            )
+            wandb_run.summary["model/parameter_count"] = parameter_count
+            wandb_run.summary["train/tokens_per_step"] = tokens_per_step
+
+        if run_record_dir is not None:
+            _write_json(
+                run_record_dir / "resolved_config.json",
+                {
+                    **asdict(cfg),
+                    "resolved_train_tokens_path": train_tokens_path,
+                    "resolved_val_tokens_path": val_tokens_path,
+                    "resolved_vocab_json_path": vocab_json_path,
+                    "resolved_resume_checkpoint_path": resume_checkpoint_path,
+                    "resolved_ckpt_path": cfg.ckpt_path,
+                    "parameter_count": parameter_count,
+                    "tokens_per_step": tokens_per_step,
+                },
+            )
 
         opt = AdamW(
             model.parameters(),
@@ -443,6 +503,11 @@ def train(cfg: TrainConfig) -> None:
         if cfg.resume and resume_checkpoint_path and Path(resume_checkpoint_path).exists():
             start_it = load_checkpoint(resume_checkpoint_path, model, opt)
             print(f"[resume] loaded checkpoint from {resume_checkpoint_path}, iteration={start_it}")
+        if start_it >= cfg.max_iters:
+            raise ValueError(
+                f"Resume checkpoint iteration {start_it} is >= max_iters {cfg.max_iters}. "
+                "Set --max_iters to the total final training step you want to reach."
+            )
 
         model.train()
 
@@ -466,6 +531,11 @@ def train(cfg: TrainConfig) -> None:
         best_val_loss: float | None = None
         best_val_ppl: float | None = None
         best_iteration: int | None = None
+        train_start_time = time.time()
+        last_step = start_it
+        last_train_loss: float | None = None
+        last_train_ppl: float | None = None
+        last_tokens_per_second: float | None = None
 
         try:
             for it in range(start_it, cfg.max_iters):
@@ -498,18 +568,26 @@ def train(cfg: TrainConfig) -> None:
                 opt.step()
 
                 step = it + 1
+                last_step = step
                 hb_loss_sum += float(loss.detach().cpu())
                 hb_loss_n += 1
                 now = time.time()
                 if now - t_hb >= cfg.heartbeat_every_s:
                     pct = 100.0 * step / cfg.max_iters
                     recent_avg = hb_loss_sum / max(1, hb_loss_n)
+                    tokens_seen = step * tokens_per_step
+                    wall_clock_seconds = now - train_start_time
+                    flops_proxy = float(6 * parameter_count * tokens_seen)
                     print(f"[hb] it={step} ({pct:.1f}%) | recent_avg_loss={recent_avg:.4f} | lr={lr:.6g}")
                     if wandb_run is not None:
                         wandb_run.log(
                             {
                                 "heartbeat/recent_avg_loss": recent_avg,
                                 "train/lr": lr,
+                                "train/tokens_seen": tokens_seen,
+                                "perf/wall_clock_seconds": wall_clock_seconds,
+                                "perf/flops_proxy": flops_proxy,
+                                "model/parameter_count": parameter_count,
                             },
                             step=step,
                         )
@@ -522,6 +600,12 @@ def train(cfg: TrainConfig) -> None:
                     toks = cfg.batch_size * cfg.context_length * cfg.log_every
                     toks_per_s = toks / max(1e-9, dt)
                     loss_value = float(loss.detach().cpu())
+                    last_train_loss = loss_value
+                    last_train_ppl = math.exp(loss_value)
+                    last_tokens_per_second = toks_per_s
+                    tokens_seen = step * tokens_per_step
+                    wall_clock_seconds = time.time() - train_start_time
+                    flops_proxy = float(6 * parameter_count * tokens_seen)
                     print(
                         f"it={step:>7} | loss={loss_value:.4f} | ppl={math.exp(loss_value):.2f} "
                         f"| lr={lr:.6g} | tok/s={toks_per_s:.1f}"
@@ -532,7 +616,11 @@ def train(cfg: TrainConfig) -> None:
                                 "train/loss": loss_value,
                                 "train/ppl": math.exp(loss_value),
                                 "train/lr": lr,
+                                "train/tokens_seen": tokens_seen,
                                 "perf/tokens_per_second": toks_per_s,
+                                "perf/wall_clock_seconds": wall_clock_seconds,
+                                "perf/flops_proxy": flops_proxy,
+                                "model/parameter_count": parameter_count,
                             },
                             step=step,
                         )
@@ -540,12 +628,19 @@ def train(cfg: TrainConfig) -> None:
 
                 if val_tokens is not None and step % cfg.eval_every == 0:
                     val_loss, val_ppl = evaluate(model, val_tokens, cfg, device)
+                    tokens_seen = step * tokens_per_step
+                    wall_clock_seconds = time.time() - train_start_time
+                    flops_proxy = float(6 * parameter_count * tokens_seen)
                     print(f"[val] it={step:>7} | loss={val_loss:.4f} | ppl={val_ppl:.2f}")
                     if wandb_run is not None:
                         wandb_run.log(
                             {
                                 "val/loss": val_loss,
                                 "val/ppl": val_ppl,
+                                "train/tokens_seen": tokens_seen,
+                                "perf/wall_clock_seconds": wall_clock_seconds,
+                                "perf/flops_proxy": flops_proxy,
+                                "model/parameter_count": parameter_count,
                             },
                             step=step,
                         )
@@ -618,6 +713,30 @@ def train(cfg: TrainConfig) -> None:
 
         finally:
             prefetcher.close()
+            if run_record_dir is not None:
+                total_tokens_seen = last_step * tokens_per_step
+                _write_json(
+                    run_record_dir / "summary.json",
+                    {
+                        "completed_iterations": last_step,
+                        "max_iters": cfg.max_iters,
+                        "target_tokens_seen": cfg.target_tokens_seen,
+                        "tokens_per_step": tokens_per_step,
+                        "tokens_seen": total_tokens_seen,
+                        "parameter_count": parameter_count,
+                        "flops_proxy": float(6 * parameter_count * total_tokens_seen),
+                        "wall_clock_seconds": time.time() - train_start_time,
+                        "last_train_loss": last_train_loss,
+                        "last_train_ppl": last_train_ppl,
+                        "last_tokens_per_second": last_tokens_per_second,
+                        "best_val_loss": best_val_loss,
+                        "best_val_ppl": best_val_ppl,
+                        "best_iteration": best_iteration,
+                        "wandb_run_id": getattr(wandb_run, "id", None),
+                        "wandb_run_name": getattr(wandb_run, "name", None),
+                        "wandb_run_url": getattr(wandb_run, "url", None),
+                    },
+                )
     finally:
         if wandb_run is not None:
             wandb_run.finish()
@@ -650,6 +769,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--grad_clip", type=float, default=1.0)
 
     p.add_argument("--max_iters", type=int, default=5000)
+    p.add_argument("--target_tokens_seen", type=int, default=None, help="Optional total training tokens to process; overrides max_iters")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--eval_every", type=int, default=500)
     p.add_argument("--eval_batches", type=int, default=10)
@@ -691,6 +811,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--checkpoint_artifact_name", type=str, default=None, help="Artifact collection name for uploaded checkpoints")
     p.add_argument("--checkpoint_keep_milestone_every", type=int, default=0, help="Add step-XXXX aliases every N steps")
     p.add_argument("--checkpoint_ttl_days", type=int, default=None, help="Optional TTL in days for W&B-hosted checkpoints")
+    p.add_argument("--run_record_dir", type=str, default=None, help="Optional local directory where resolved config and summary JSON will be written")
 
     args = p.parse_args()
     return TrainConfig(**vars(args))
