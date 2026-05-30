@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from model.transformer import TransformerLM
+from model import build_model
 from training.training import (
     AdamW,
     clip_grad_l2,
@@ -113,11 +113,20 @@ class TrainConfig:
     context_length: int
     batch_size: int
 
+    model_arch: str
     d_model: int
     num_layers: int
     num_heads: int
     d_ff: int
     rope_theta: float
+
+    # Backend-specific knobs (only consumed by the relevant arch).
+    ssm_d_state: int
+    ssm_d_conv: int
+    ssm_expand: int
+    subq_kind: str
+    subq_window_size: int
+    subq_feature_map: str
 
     max_lr: float
     min_lr: float
@@ -443,7 +452,8 @@ def train(cfg: TrainConfig) -> None:
         val_tokens = load_memmap_tokens(val_tokens_path) if val_tokens_path else None
 
         assert cfg.vocab_size is not None
-        model = TransformerLM(
+        model = build_model(
+            arch=cfg.model_arch,
             vocab_size=cfg.vocab_size,
             context_length=cfg.context_length,
             d_model=cfg.d_model,
@@ -453,10 +463,16 @@ def train(cfg: TrainConfig) -> None:
             rope_theta=cfg.rope_theta,
             device=device,
             dtype=dtype,
+            ssm_d_state=cfg.ssm_d_state,
+            ssm_d_conv=cfg.ssm_d_conv,
+            ssm_expand=cfg.ssm_expand,
+            subq_kind=cfg.subq_kind,
+            subq_window_size=cfg.subq_window_size,
+            subq_feature_map=cfg.subq_feature_map,
         )
         parameter_count = count_parameters(model)
         tokens_per_step = _tokens_per_step(cfg)
-        print(f"[model] parameters={parameter_count} | tokens_per_step={tokens_per_step}")
+        print(f"[model] arch={cfg.model_arch} parameters={parameter_count} | tokens_per_step={tokens_per_step}")
 
         if wandb_run is not None:
             wandb_run.config.update(
@@ -468,11 +484,13 @@ def train(cfg: TrainConfig) -> None:
                     "resolved_vocab_size": cfg.vocab_size,
                     "resolved_max_iters": cfg.max_iters,
                     "resolved_target_tokens_seen": cfg.target_tokens_seen,
+                    "model/arch": cfg.model_arch,
                     "model/parameter_count": parameter_count,
                     "train/tokens_per_step": tokens_per_step,
                 },
                 allow_val_change=True,
             )
+            wandb_run.summary["model/arch"] = cfg.model_arch
             wandb_run.summary["model/parameter_count"] = parameter_count
             wandb_run.summary["train/tokens_per_step"] = tokens_per_step
 
@@ -752,11 +770,27 @@ def parse_args() -> TrainConfig:
     p.add_argument("--context_length", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=32)
 
+    p.add_argument(
+        "--model_arch",
+        type=str,
+        default="transformer",
+        help="Model architecture: transformer | ssm | subquadratic. See EXPERIMENTS.md.",
+    )
     p.add_argument("--d_model", type=int, default=384)
     p.add_argument("--num_layers", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=6)
     p.add_argument("--d_ff", type=int, default=1024)
     p.add_argument("--rope_theta", type=float, default=10000.0)
+
+    # SSM (Mamba) backend knobs — ignored unless --model_arch ssm.
+    p.add_argument("--ssm_d_state", type=int, default=16)
+    p.add_argument("--ssm_d_conv", type=int, default=4)
+    p.add_argument("--ssm_expand", type=int, default=2)
+
+    # Sub-quadratic backend knobs — ignored unless --model_arch subquadratic.
+    p.add_argument("--subq_kind", type=str, default="linear", help="linear | sliding")
+    p.add_argument("--subq_window_size", type=int, default=128)
+    p.add_argument("--subq_feature_map", type=str, default="elu", help="elu | relu")
 
     p.add_argument("--max_lr", type=float, default=3e-4)
     p.add_argument("--min_lr", type=float, default=3e-5)

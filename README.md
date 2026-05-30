@@ -198,3 +198,23 @@ DEVICE=auto \
 DTYPE=float32 \
 bash scripts/run_compute_optimal_scaling_sweep.sh
 ```
+
+### Future Work — Architecture Comparison & Capability Probes
+
+Beyond the orthodox Transformer baseline, the next research track compares
+**state-space models (SSMs)** and **sub-quadratic attention** variants against
+the Transformer at **matched active parameters and tokens seen**, then probes
+each architecture's *future capability* (long-context generalization, selective
+copy, induction, needle-in-a-haystack, parenthesis matching) with shared
+baselines.
+
+Scaffolding is already in place:
+
+- `--model_arch {transformer, ssm, subquadratic}` flag on `scripts/train_lm.py`
+- `model.build_model(...)` registry in `model/__init__.py`
+- Stub backends `model/ssm.py` and `model/subquadratic.py`
+- `model/arch` logged to W&B config and summary for every run
+
+The full roadmap — variants, matched-compute methodology, capability metrics,
+baselines, phasing, and open decisions — lives in [EXPERIMENTS.md](EXPERIMENTS.md).
+
